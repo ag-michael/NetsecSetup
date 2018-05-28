@@ -1,0 +1,410 @@
+#!/usr/bin/python
+
+import subprocess
+import os 
+import sys
+import select
+import traceback 
+import re
+import logging
+import time
+import thread
+import socket
+import json
+
+class Configuration:
+	def __init__(self,args):
+		self.current_config={
+				"logfile":"/var/log/Netsec.log",
+				"watchdog_host":"1.1.1.1",
+				"watchdog_port":80,
+				"real_interface":"wlan0",
+				"ovpn_ip":"192.168.0.1",
+				"ovpn_cmdline":["/usr/sbin/openvpn","--config","/etc/openvpn/myvpn.ovpn"],
+				"dnscrypt_cmd":["dnscrypt-proxy","-R","cs-de"],
+				"real_defgwy":"10.0.0.1",
+				"latency_mindelta":10,
+				"leakcmd":["/bin/true"],
+				"ouilist":"/etc/ouilist.txt"
+			}
+		
+		if len(args)>1:
+			try:
+				with open(args[1]) as config_file:
+					self.current_config=json.loads(config_file.read().strip())
+			except Exception as ex:
+				print("Error loading configuration from:"+str(args[1]))
+				logging.exception("Error loading configuration from:"+str(args[1]))
+				sys.exit(1)
+		logging.basicConfig(filename=self.logfile,level=logging.INFO,format='%(asctime)s - NetsecSetup - %(name)s - %(levelname)s - %(message)s')
+		
+	@property	
+	def logfile(self):
+		return self.current_config["logfile"]
+	@property
+	def watchdog_host(self):
+		return self.current_config["watchdog_host"]
+	@property
+	def watchdog_port(self):
+		return self.current_config["watchdog_port"]
+	@property
+	def real_interface(self):
+		return self.current_config["real_interface"]
+	@property
+	def ovpn_ip(self):
+		return self.current_config["ovpn_ip"]
+	@property
+	def ovpn_cmdline(self):
+		return self.current_config["ovpn_cmdline"]
+	@property
+	def dnscrypt_cmd(self):
+		return self.current_config["dnscrypt_cmd"]
+	@property
+	def real_defgwy(self):
+		return self.current_config["real_defgwy"]
+	@property
+	def latency_mindelta(self):
+		return self.current_config["latency_mindelta"]
+	@property
+	def leakcmd(self):
+		return self.current_config["leakcmd"]
+	@property
+	def ouilist(self):
+		return self.current_config["ouilist"]
+	
+	
+class Helpers(object):
+	def __init__(self):
+		self.failure_detected=True
+		self.ovpn_ready=False 
+		self.min_latency=0
+		self.trace_pattern=re.compile(r"^\d+\s[^\*]*\s[^\*]*\s[^\*]*\s.*")
+	def hopcount(self,watchdog_host):
+		pipe=subprocess.Popen(["traceroute","-I","-w","2","-n","-4",watchdog_host],shell=False,stdout=subprocess.PIPE,stderr=open("/dev/null"),bufsize=65535)
+		
+		poll=select.poll()
+		poll.register(pipe.stdout)
+		hops=0
+		output=''
+		while pipe.poll() is None:
+			
+			fds=poll.poll()
+			for fd,ev in fds:
+				output+=os.read(fd,65535)
+
+		if len(output.strip())>0:
+			count=len(output.strip().splitlines())
+			if count>1:
+				for line in output.strip().splitlines():
+					line=line.strip()
+					if len(line)>1 and not None is re.match(self.trace_pattern,line):
+						print("[T]"+line)
+						hops+=1
+					else:
+						print("??"+line)
+		return hops	
+
+
+			
+	def call(self,cmdline):
+		if not type(cmdline) is list:
+			raise ValueError("Command line arguments are not of a list format")
+			return -1
+		exitval=subprocess.call(cmdline,shell=False)
+		if  exitval:
+			logging.warning("[failed command] "+' '.join(cmdline))
+		else:
+			logging.info("[succesful command] "+' '.join(cmdline))
+		return exitval
+	
+	
+class DNS(Helpers):
+	def __init__(self,config):
+		super(DNS,self).__init__()
+		self.config=config
+	def dnscrypt(self):
+		if subprocess.call(["which","dnscrypt-proxy"],shell=False,stdout=open("/dev/null"),stderr=open("/dev/null")):
+			logging.warning("dnscrypt_proxy not found. dnscrypt thread will not run.")
+			return 
+		pipe=subprocess.Popen(self.config.dnscrypt_cmd,shell=False,stdout=subprocess.PIPE,stderr=open("/dev/null"),bufsize=0)
+		poll=select.poll()
+		poll.register(pipe.stdout)
+		while pipe.poll() is None:
+			if self.failure_detected:
+				break
+			fds=poll.poll(5)
+			for fd,ev in fds:
+				output=os.read(fd,65535)
+			print(output)
+			
+class OVPN(Helpers):
+	def __init__(self,config):
+		super(OVPN,self).__init__()
+		self.config=config
+		self.regular_expressions=[(".*Initialization Sequence Completed.*",self.ovpndone),(".*process exiting.*",self.ovpnrestart)]
+		self.patterns=[]
+		self.kill_list=["openvpn","dnscrypt_proxy"]
+		self.latency_pattern=re.compile(".*time=(\d+[.\d]*) ms")
+		if subprocess.call(["which","openvpn"],shell=False,stdout=open("/dev/null"),stderr=open("/dev/null")):
+			self.critical("OpenVPN binary 'openvpn' could not be found. exiting immediately")
+			sys.exit(0)
+		if subprocess.call(["which","ip"],shell=False,stdout=open("/dev/null"),stderr=open("/dev/null")):
+			self.critical("IPRoute2 binary 'ip' could not be found. exiting immediately")
+			sys.exit(0)
+		if subprocess.call(["which","iptables"],shell=False,stdout=open("/dev/null"),stderr=open("/dev/null")):
+			self.critical("IPTables binary 'iptables' could not be found. exiting immediately")
+			sys.exit(0)
+			
+	def ipt_lockdown(self):
+		self.call(["iptables","-I","OUTPUT","-o",self.config.real_interface,"-j","DROP"])
+		self.call(["iptables","-I","OUTPUT","-o",self.config.real_interface,"-d",self.config.ovpn_ip,"-j","ACCEPT"])
+		self.call(["iptables","-I","INPUT","-i",self.config.real_interface,"-j","DROP"])
+		self.call(["iptables","-I","INPUT","-i",self.config.real_interface,"-s",self.config.ovpn_ip,"-j","ACCEPT"])
+		self.call(["ip","route","add",self.config.ovpn_ip,"via",self.config.real_defgwy,"dev",self.config.real_interface,"priority","0","metric","1"])
+		
+	def ovpndone(self,line):
+		logging.info("OpenVPN started: "+line)
+		print("[+] OpenVPN started")
+		self.failure_detected=False
+		time.sleep(10)
+		self.ovpn_ready=True
+		return False 
+
+	def ovpnrestart(self,line):
+		logging.info("OpenVPN Failure detected,restarting: "+line)
+		print("[!] OpenVPN failure,restarting")
+		time.sleep(5)
+		return True 
+
+
+	def set_minlatency(self,ip):
+		while True:
+			try:
+				ping_output=subprocess.check_output(["ping","-c","10","-n","-4",ip],shell=False,bufsize=65534).splitlines()
+				
+				for line in ping_output:
+					res=re.match(self.latency_pattern,line)
+					if not None is res and not None is res.group(1):
+						latency=int(float(res.group(1)))
+						if self.min_latency == 0:
+							self.min_latency = latency
+						elif latency < self.min_latency:
+							self.min_latency = latency
+				break
+		
+			except subprocess.CalledProcessError:
+				logging.warning("VPN gateway ping failure."+ip)
+				print("VPN gateway ping failure:"+ip)
+				time.sleep(3)
+				continue
+		print("Minimum latency set to: "+str(self.min_latency))
+		logging.info("Minimum latency set to: "+str(self.min_latency))
+		
+	def ovpnwatchdog(self):
+		while not self.ovpn_ready:
+			time.sleep(1)
+		
+		hopcounter=0
+		while True:
+			'''try:
+				hops=self.hopcount()
+				if hops>0 and hops > hopcounter:
+					hopcounter=hops
+					logging.info("IP hop count increase detected using traceroute, new hop count:"+str(hopcounter))
+					print("[*] IP hop count increase detected using traceroute, new hop count:"+str(hopcounter))
+				elif hops > 0 and hops < hopcounter:
+					logging.critical("IP hop count reduction detected using traceroute,new hop count "+str(hops)+".Executing leak prevention command...")
+					print("[!!] IP hop count reduction detected using traceroute,new hop count "+str(hops)+".Executing leak prevention command...")
+					self.call(leakcmd)	
+			except Exception as e:
+				print(e)    '''
+			try:
+				if self.failure_detected==True or not self.ovpn_ready:
+					continue			
+				ping_output=subprocess.check_output(["ping","-c","5","-n","-4",self.config.watchdog_host],shell=False,bufsize=65534).splitlines()
+				for line in ping_output:
+					res=re.match(self.latency_pattern,line)
+					if not None is res and not None is res.group(1):
+						latency=int(float(res.group(1).strip()))
+						if latency < self.min_latency-self.config.latency_mindelta:
+							self.failure_detected=True
+							logging.critical("Watchdog latency "+str(latency)+" ms is less than VPN gateway's baseline minimum latency "+str(min_latency)+" ms. Executing leak prevention command:"+str(self.config.leakcmd))
+							self.call(self.config.leakcmd)
+							time.sleep(10)
+						else:
+							logging.debug("Ping latency watchdog,current latency: "+str(latency))
+			except subprocess.CalledProcessError:
+				print("ping watchdog failure")
+				
+			except Exception as ex:
+				print(ex)
+				logging.exception("Latency watchdog exception")
+				continue
+			try:
+				if self.failure_detected==True:
+					continue
+				sk=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+				sk.settimeout(5.0)
+				sk.connect((self.config.watchdog_host,self.config.watchdog_port))
+				sk.close()
+				logging.debug("Watchdog test succeeded:"+self.config.watchdog_host)
+				time.sleep(10.0)
+			except Exception as ex:
+				self.failure_detected=True
+				print(ex)
+				logging.warning("Watchdog failed to connect to host:"+self.watchdog_host)
+				print("Watchdog failed to connect to host:"+self.watchdog_host)
+				time.sleep(10)
+				continue
+			
+	def randmac(self,valid_oui):
+		mac=''
+		rand_bytes=''
+		desc=''
+		randoui=-1
+		
+		for b in os.urandom(4):
+			randoui=((randoui<<8)|ord(b))%(len(valid_oui)-1)
+			
+		rand_bytes=os.urandom(3)
+		hex_bytes=str(rand_bytes).encode('hex')
+		i=0
+		for b in (valid_oui[randoui][0].strip()+hex_bytes.strip()):
+			mac+=b
+			if i%2 == 1:
+				mac+=":"
+			i+=1
+		newmac=mac.strip().strip(":")
+		logging.info("Generated a random mac address '"+newmac+"', OUI description: '"+valid_oui[randoui][1]+"'")
+		return newmac
+
+	def set_randmac(self,iface):
+		ouilist=''
+		if os.path.exists(self.config.ouilist):
+			ouilist=self.config.ouilist
+		elif os.path.exists("./ouilist.txt"):
+			ouilist="./ouilist.txt"
+		else:
+			print("Unable to set a random mac address: OUI list not found")
+			logging.warning("Unable to set a random mac address: OUI list not found")
+			return 
+		oui_pattern=re.compile(r"^([0-9a-fA-F]+)\s(.*)")
+		valid_oui=[]
+		with open(ouilist) as ouifile:
+			for line in ouifile.read().splitlines():
+				res=re.match(oui_pattern,line)
+				if not None is res and not None is res.group(1):
+					desc=''
+					if not None is res.group(2):
+						desc=res.group(2)
+					valid_oui.append((res.group(1),desc))
+					
+		newmac=self.randmac(valid_oui)
+		self.call(["ip","link","set",iface,"down"])
+		self.call(["ip","link","set","dev",iface,"addr",newmac])
+		self.call(["ip","link","set",iface,"up"])
+		output=subprocess.check_output(["ip","link","show","dev",iface],shell=False).splitlines()
+		if newmac.lower() in output[1].strip():
+			logging.info("New random mac address set:"+newmac)
+		else:
+			logging.warning("New mac address does not appear to be set")
+			
+		
+	def makeready(self):
+		if not os.geteuid() == 0:
+			raise Exception("Current user is not superuser")
+			return -1
+		cwd=os.getcwd().strip()
+		pid=os.getpid()
+		for l in subprocess.check_output(["ps","aux"],shell=False).splitlines():
+			if cwd in l:
+				m=re.match(r".*\s(\d+)\s.*",l)
+				if not None is m.group(1) and not str(pid).strip() == str(m.group(1)).strip():
+					self.call(["kill","-9",m.group(1)])
+		for process in self.kill_list:			
+			subprocess.call(["killall","-9","-e","-q",process],shell=False)
+
+		
+		self.set_randmac(self.config.real_interface)
+		self.ipt_lockdown()
+		
+		self.call(["ip","route","change","blackhole","default","preference","0"])
+		if self.call(["ip","route","add","blackhole","default","metric","0","preference","0"]) != 0:
+			self.call(["ip","route","replace","blackhole","default","metric","0","preference","0"]) 
+		for entry in self.regular_expressions:
+			self.patterns.append((re.compile(entry[0]),entry[1]))
+		
+		
+	def vpn_loop(self):
+		if not type(self.config.ovpn_cmdline) is list:
+			raise ValueError("OpenVPNCommand line argument is not of a list format")
+			return -1
+		exitval=-1
+		pipe=subprocess.Popen(self.config.ovpn_cmdline,shell=False,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+		
+		poll=select.poll()
+		poll.register(pipe.stdout)
+		poll.register(pipe.stderr)
+		
+		while pipe.poll() is None:
+			
+			if self.failure_detected and self.ovpn_ready:
+				pipe.terminate()
+				time.sleep(10.0)
+				logging.warning("Restarting after OpenVPN failure detection.")
+				self.ovpn_ready=False
+				return
+			fds=poll.poll(5)
+			for fd,ev in fds:
+				if not pipe.returncode is None or ev==select.POLLHUP or ev==select.POLLERR:
+					break
+				output=os.read(fd,4096)
+				logging.info(output.strip())
+				for p in self.patterns:
+					for line in output.splitlines():
+						matches=re.match(p[0],line)
+						#print(line)
+						if not None is matches:
+							if p[1](line):
+								pipe.terminate()
+								return
+		if not pipe.returncode is None:
+			exitval=pipe.returncode
+			
+		if  exitval:
+			logging.warning("[failed command] "+' '.join(self.config.ovpn_cmdline))
+		else:
+			logging.info("[succesful command] "+' '.join(self.config.ovpn_cmdline))
+		return exitval
+
+
+def netservices(configuration):
+	dns=DNS(configuration)
+	vpn=OVPN(configuration)
+	
+	thread.start_new_thread(vpn.ovpnwatchdog,())
+	thread.start_new_thread(dns.dnscrypt,())
+	
+	while True:
+		vpn.makeready()
+		vpn.set_minlatency(configuration.ovpn_ip)
+		vpn.vpn_loop()
+	
+def main():
+	configuration=Configuration(sys.argv)
+	print("Storing logs in: "+configuration.logfile)
+	logging.info("Storing logs in: "+configuration.logfile)
+	logging.info("Starting Netsec setup")
+	try:
+		netservices(configuration)
+	except Exception as ex:
+		traceback.print_exc()
+		logging.exception("Exception encountered,exiting:"+str(ex))
+		time.sleep(3.0)
+		sys.exit(1)
+
+if __name__ == "__main__":
+	if not os.fork():
+		main()
+	else:
+		sys.exit(0)

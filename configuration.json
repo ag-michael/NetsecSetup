@@ -1,0 +1,12 @@
+{
+	"logfile":"/var/log/Netsec.log",
+	"watchdog_host":"1.1.1.1",
+	"watchdog_port":80,
+	"real_interface":"wlan0",
+	"ovpn_ip":"192.168.0.1",
+	"ovpn_cmdline":["/usr/sbin/openvpn","--config","/etc/openvpn/myvpn.ovpn"],
+	"dnscrypt_cmd":["dnscrypt-proxy","-R","cs-de"],
+	"real_defgwy":"10.0.0.1",
+	"latency_mindelta":10,
+	"leakcmd":["/bin/true"]
+}
